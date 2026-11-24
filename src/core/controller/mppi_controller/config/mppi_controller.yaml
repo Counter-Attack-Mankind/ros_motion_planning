@@ -1,4 +1,28 @@
-# MPPI implementation stage. Stage 1 validates move_base/pluginlib integration
-# and intentionally commands zero velocity. Algorithm parameters will be added
-# in subsequent development stages.
-implementation_stage: 1
+# Sampling and prediction
+sample_count: 200
+prediction_steps: 20
+optimization_iterations: 1
+random_seed: 42
+
+# Gaussian control perturbations
+noise_std_v: 0.20
+noise_std_omega: 0.50
+temperature: 1.0
+
+# Trajectory cost weights
+path_distance_weight: 8.0
+path_heading_weight: 0.5
+terminal_progress_weight: 6.0
+control_v_weight: 0.2
+control_omega_weight: 0.1
+control_delta_v_weight: 1.0
+control_delta_omega_weight: 0.2
+
+# Per-control-step increments. Absolute velocity limits come from Controller.
+max_control_delta_v: 0.05
+max_control_delta_omega: 0.30
+
+# A periodic global replan keeps the warm start unless the goal changes by more
+# than either threshold.
+goal_reset_distance: 0.50
+goal_reset_angle: 0.50

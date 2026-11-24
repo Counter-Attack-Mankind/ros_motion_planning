@@ -10,9 +10,12 @@ find_package(catkin REQUIRED COMPONENTS
   costmap_2d
   geometry_msgs
   nav_core
+  nav_msgs
   pluginlib
   roscpp
   system_config
+  tf2
+  tf2_geometry_msgs
   tf2_ros
 )
 
@@ -26,9 +29,12 @@ catkin_package(
     costmap_2d
     geometry_msgs
     nav_core
+    nav_msgs
     pluginlib
     roscpp
     system_config
+    tf2
+    tf2_geometry_msgs
     tf2_ros
 )
 
