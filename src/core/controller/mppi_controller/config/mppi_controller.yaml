@@ -22,6 +22,10 @@ control_delta_omega_weight: 0.2
 max_control_delta_v: 0.05
 max_control_delta_omega: 0.30
 
+# Hard collision checking uses the runtime local-costmap footprint.
+collision_check_resolution: 0.025
+treat_unknown_as_collision: true
+
 # A periodic global replan keeps the warm start unless the goal changes by more
 # than either threshold.
 goal_reset_distance: 0.50

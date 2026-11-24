@@ -13,6 +13,9 @@
 #include <limits>
 #include <utility>
 
+#include <base_local_planner/costmap_model.h>
+#include <costmap_2d/cost_values.h>
+#include <costmap_2d/layered_costmap.h>
 #include <nav_msgs/Odometry.h>
 #include <pluginlib/class_list_macros.h>
 #include <tf2/exceptions.h>
@@ -36,6 +39,7 @@ MPPIController::MPPIController()
   : initialized_(false)
   , goal_reached_(false)
   , has_goal_(false)
+  , footprint_logged_(false)
   , tf_(nullptr)
   , sample_count_(200)
   , prediction_steps_(20)
@@ -53,6 +57,8 @@ MPPIController::MPPIController()
   , control_delta_omega_weight_(0.2)
   , max_control_delta_v_(0.05)
   , max_control_delta_omega_(0.3)
+  , collision_check_resolution_(0.025)
+  , treat_unknown_as_collision_(true)
   , goal_reset_distance_(0.5)
   , goal_reset_angle_(0.5)
   , random_generator_(random_seed_) {
@@ -94,7 +100,10 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
   R_INFO << "MPPI Controller initialized: samples=" << sample_count_
          << ", prediction steps=" << prediction_steps_
          << ", iterations=" << optimization_iterations_
-         << ", dt=" << control_dt_ << " s.";
+         << ", dt=" << control_dt_
+         << " s, collision interpolation=" << collision_check_resolution_
+         << " m, unknown space="
+         << (treat_unknown_as_collision_ ? "blocked" : "allowed") << ".";
 }
 
 bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
@@ -126,6 +135,10 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                    max_control_delta_v_);
   private_nh.param("max_control_delta_omega", max_control_delta_omega_,
                    max_control_delta_omega_);
+  private_nh.param("collision_check_resolution", collision_check_resolution_,
+                   collision_check_resolution_);
+  private_nh.param("treat_unknown_as_collision", treat_unknown_as_collision_,
+                   treat_unknown_as_collision_);
   private_nh.param("goal_reset_distance", goal_reset_distance_,
                    goal_reset_distance_);
   private_nh.param("goal_reset_angle", goal_reset_angle_, goal_reset_angle_);
@@ -141,6 +154,8 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                             std::isfinite(max_control_delta_omega_) &&
                             max_control_delta_v_ > 0.0 &&
                             max_control_delta_omega_ > 0.0 &&
+                            std::isfinite(collision_check_resolution_) &&
+                            collision_check_resolution_ > 0.0 &&
                             std::isfinite(goal_reset_distance_) &&
                             std::isfinite(goal_reset_angle_) &&
                             goal_reset_distance_ >= 0.0 &&
@@ -266,6 +281,61 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     return false;
   }
 
+  const State initial_state{ robot_pose_local.pose.position.x,
+                             robot_pose_local.pose.position.y,
+                             tf2::getYaw(robot_pose_local.pose.orientation) };
+  if (!std::isfinite(initial_state.x) || !std::isfinite(initial_state.y) ||
+      !std::isfinite(initial_state.yaw)) {
+    ROS_ERROR_THROTTLE(1.0,
+                       "MPPI Controller received a non-finite robot pose.");
+    return false;
+  }
+
+  costmap_2d::Costmap2D* local_costmap = costmap_ros_->getCostmap();
+  costmap_2d::LayeredCostmap* layered_costmap =
+      costmap_ros_->getLayeredCostmap();
+  const std::vector<geometry_msgs::Point> footprint =
+      costmap_ros_->getRobotFootprint();
+  if (local_costmap == nullptr || layered_costmap == nullptr ||
+      footprint.size() < 3) {
+    ROS_ERROR_THROTTLE(
+        1.0,
+        "MPPI Controller has no valid runtime local-costmap footprint.");
+    return false;
+  }
+
+  const double inscribed_radius = layered_costmap->getInscribedRadius();
+  const double circumscribed_radius = layered_costmap->getCircumscribedRadius();
+  if (!std::isfinite(inscribed_radius) || inscribed_radius < 0.0 ||
+      !std::isfinite(circumscribed_radius) || circumscribed_radius < 0.0) {
+    ROS_ERROR_THROTTLE(
+        1.0, "MPPI Controller received invalid local-costmap footprint radii.");
+    return false;
+  }
+
+  if (!footprint_logged_) {
+    R_INFO << "MPPI collision checking uses " << footprint.size()
+           << " runtime footprint points in frame '"
+           << robot_pose_local.header.frame_id << "', inscribed radius="
+           << inscribed_radius << " m, circumscribed radius="
+           << circumscribed_radius << " m, costmap resolution="
+           << local_costmap->getResolution() << " m.";
+    footprint_logged_ = true;
+  }
+
+  // robot_pose_local and every predicted state remain in the local costmap's
+  // global frame; CostmapModel rotates/translates this robot-frame footprint.
+  base_local_planner::CostmapModel collision_model(*local_costmap);
+  if (!_isStateCollisionFree(initial_state, collision_model, footprint,
+                             inscribed_radius, circumscribed_radius)) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "MPPI Controller robot footprint is in collision, unknown space, or "
+        "outside the local costmap; commanding zero velocity.");
+    _resetControlSequence();
+    return false;
+  }
+
   const std::string plan_frame = global_plan_.front().header.frame_id;
   if (plan_frame.empty()) {
     ROS_ERROR_THROTTLE(1.0, "MPPI Controller received a plan with no frame ID.");
@@ -312,6 +382,18 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
       cmd_vel = geometry_msgs::Twist();
       return false;
     }
+
+    State rotated_state = initial_state;
+    _predictState(&rotated_state, Control{ 0.0, cmd_vel.angular.z });
+    if (!_isMotionCollisionFree(initial_state, rotated_state, collision_model,
+                                footprint, inscribed_radius,
+                                circumscribed_radius)) {
+      cmd_vel = geometry_msgs::Twist();
+      ROS_WARN_THROTTLE(
+          1.0,
+          "MPPI Controller rejected an unsafe final-goal rotation command.");
+      return false;
+    }
     return true;
   }
   goal_reached_ = false;
@@ -329,23 +411,25 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     return false;
   }
 
-  const State initial_state{ robot_pose_local.pose.position.x,
-                             robot_pose_local.pose.position.y,
-                             tf2::getYaw(robot_pose_local.pose.orientation) };
-  if (!std::isfinite(initial_state.x) || !std::isfinite(initial_state.y) ||
-      !std::isfinite(initial_state.yaw)) {
-    ROS_ERROR_THROTTLE(1.0,
-                       "MPPI Controller received a non-finite robot pose.");
-    return false;
-  }
-
   std::size_t valid_sample_count = 0;
+  std::size_t collision_rejection_count = 0;
   if (!_optimizeControlSequence(initial_state, current_control, reference_plan,
-                                &valid_sample_count) ||
+                                collision_model, footprint, inscribed_radius,
+                                circumscribed_radius, &valid_sample_count,
+                                &collision_rejection_count) ||
       nominal_controls_.empty()) {
+    _resetControlSequence();
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count();
     ROS_WARN_THROTTLE(
         1.0,
-        "MPPI Controller could not produce a valid weighted control sequence.");
+        "MPPI Controller has no feasible weighted control sequence "
+        "(valid=%zu/%d, collision rejected=%zu, cycle=%.3f ms); commanding "
+        "zero velocity.",
+        valid_sample_count, sample_count_ * optimization_iterations_,
+        collision_rejection_count, elapsed_ms);
     return false;
   }
 
@@ -364,6 +448,33 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     return false;
   }
 
+  std::vector<Control> execution_controls = nominal_controls_;
+  execution_controls.front() = Control{ cmd_vel.linear.x, cmd_vel.angular.z };
+  Control execution_previous = execution_controls.front();
+  for (std::size_t index = 1; index < execution_controls.size(); ++index) {
+    execution_controls[index] =
+        _projectControl(execution_controls[index], execution_previous);
+    execution_previous = execution_controls[index];
+  }
+  if (!_isControlSequenceCollisionFree(
+          initial_state, execution_controls, collision_model, footprint,
+          inscribed_radius, circumscribed_radius)) {
+    cmd_vel = geometry_msgs::Twist();
+    _resetControlSequence();
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count();
+    ROS_WARN_THROTTLE(
+        1.0,
+        "MPPI Controller rejected the optimized command because its final "
+        "predicted trajectory is unsafe (valid=%zu/%d, collision rejected=%zu, "
+        "cycle=%.3f ms); commanding zero velocity.",
+        valid_sample_count, sample_count_ * optimization_iterations_,
+        collision_rejection_count, elapsed_ms);
+    return false;
+  }
+
   _shiftControlSequence();
 
   const double elapsed_ms =
@@ -372,10 +483,11 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
           .count();
   ROS_INFO_THROTTLE(
       2.0,
-      "MPPI cycle %.3f ms, valid samples %zu/%d, command v=%.3f m/s, "
-      "omega=%.3f rad/s.",
-      elapsed_ms, valid_sample_count, sample_count_, cmd_vel.linear.x,
-      cmd_vel.angular.z);
+      "MPPI cycle %.3f ms, valid samples %zu/%d, collision rejected %zu, "
+      "command v=%.3f m/s, omega=%.3f rad/s.",
+      elapsed_ms, valid_sample_count,
+      sample_count_ * optimization_iterations_,
+      collision_rejection_count, cmd_vel.linear.x, cmd_vel.angular.z);
   return true;
 }
 
@@ -418,7 +530,13 @@ bool MPPIController::_transformPlan(
 bool MPPIController::_optimizeControlSequence(
     const State& initial_state, const Control& current_control,
     const std::vector<geometry_msgs::PoseStamped>& reference_plan,
-    std::size_t* valid_sample_count) {
+    base_local_planner::CostmapModel& collision_model,
+    const std::vector<geometry_msgs::Point>& footprint,
+    double inscribed_radius, double circumscribed_radius,
+    std::size_t* valid_sample_count,
+    std::size_t* collision_rejection_count) {
+  *valid_sample_count = 0;
+  *collision_rejection_count = 0;
   if (reference_plan.empty() || nominal_controls_.size() !=
                                     static_cast<std::size_t>(prediction_steps_)) {
     return false;
@@ -436,6 +554,8 @@ bool MPPIController::_optimizeControlSequence(
 
   std::normal_distribution<double> normal_distribution(0.0, 1.0);
   std::size_t final_valid_sample_count = 0;
+  std::size_t total_valid_sample_count = 0;
+  std::size_t total_collision_rejection_count = 0;
 
   for (int iteration = 0; iteration < optimization_iterations_; ++iteration) {
     std::vector<std::vector<Control>> sampled_controls(
@@ -468,10 +588,18 @@ bool MPPIController::_optimizeControlSequence(
         sampled_control = _projectControl(sampled_control, previous_control);
         sampled_controls[sample][step] = sampled_control;
 
+        const State previous_state = state;
         _predictState(&state, sampled_control);
         if (!std::isfinite(state.x) || !std::isfinite(state.y) ||
             !std::isfinite(state.yaw)) {
           sample_valid = false;
+          break;
+        }
+        if (!_isMotionCollisionFree(previous_state, state, collision_model,
+                                    footprint, inscribed_radius,
+                                    circumscribed_radius)) {
+          sample_valid = false;
+          ++total_collision_rejection_count;
           break;
         }
 
@@ -512,7 +640,10 @@ bool MPPIController::_optimizeControlSequence(
       }
     }
 
+    total_valid_sample_count += iteration_valid_sample_count;
     if (iteration_valid_sample_count == 0) {
+      *valid_sample_count = total_valid_sample_count;
+      *collision_rejection_count = total_collision_rejection_count;
       return false;
     }
 
@@ -523,6 +654,8 @@ bool MPPIController::_optimizeControlSequence(
       }
     }
     if (!std::isfinite(minimum_cost)) {
+      *valid_sample_count = total_valid_sample_count;
+      *collision_rejection_count = total_collision_rejection_count;
       return false;
     }
 
@@ -544,6 +677,8 @@ bool MPPIController::_optimizeControlSequence(
     }
 
     if (!std::isfinite(weight_sum) || weight_sum <= kNumericalEpsilon) {
+      *valid_sample_count = total_valid_sample_count;
+      *collision_rejection_count = total_collision_rejection_count;
       return false;
     }
 
@@ -570,8 +705,100 @@ bool MPPIController::_optimizeControlSequence(
     final_valid_sample_count = iteration_valid_sample_count;
   }
 
-  *valid_sample_count = final_valid_sample_count;
+  *valid_sample_count = total_valid_sample_count;
+  *collision_rejection_count = total_collision_rejection_count;
   return final_valid_sample_count > 0;
+}
+
+bool MPPIController::_isStateCollisionFree(
+    const State& state,
+    base_local_planner::CostmapModel& collision_model,
+    const std::vector<geometry_msgs::Point>& footprint,
+    double inscribed_radius, double circumscribed_radius) const {
+  if (!std::isfinite(state.x) || !std::isfinite(state.y) ||
+      !std::isfinite(state.yaw)) {
+    return false;
+  }
+
+  const costmap_2d::Costmap2D* local_costmap = costmap_ros_->getCostmap();
+  unsigned int map_x = 0;
+  unsigned int map_y = 0;
+  if (local_costmap == nullptr ||
+      !local_costmap->worldToMap(state.x, state.y, map_x, map_y)) {
+    return false;
+  }
+  const unsigned char center_cost = local_costmap->getCost(map_x, map_y);
+  if (center_cost == costmap_2d::NO_INFORMATION &&
+      treat_unknown_as_collision_) {
+    return false;
+  }
+  if (center_cost != costmap_2d::NO_INFORMATION &&
+      center_cost >= costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
+    return false;
+  }
+
+  const double footprint_cost = collision_model.footprintCost(
+      state.x, state.y, state.yaw, footprint, inscribed_radius,
+      circumscribed_radius);
+  if (!std::isfinite(footprint_cost)) {
+    return false;
+  }
+  if (footprint_cost >= 0.0) {
+    return true;
+  }
+
+  // CostmapModel reports -2 for unknown space. Lethal obstacles (-1), map
+  // bounds violations (-3), and any unrecognized negative status are always
+  // rejected.
+  return footprint_cost == -2.0 && !treat_unknown_as_collision_;
+}
+
+bool MPPIController::_isMotionCollisionFree(
+    const State& from, const State& to,
+    base_local_planner::CostmapModel& collision_model,
+    const std::vector<geometry_msgs::Point>& footprint,
+    double inscribed_radius, double circumscribed_radius) const {
+  const double translation = std::hypot(to.x - from.x, to.y - from.y);
+  const double yaw_delta = common::geometry::normalizeAngle(to.yaw - from.yaw);
+  const double rotation_sweep =
+      std::fabs(yaw_delta) * circumscribed_radius;
+  const double maximum_sweep = std::max(translation, rotation_sweep);
+  const std::size_t interpolation_steps = std::max<std::size_t>(
+      1, static_cast<std::size_t>(
+             std::ceil(maximum_sweep / collision_check_resolution_)));
+
+  for (std::size_t index = 1; index <= interpolation_steps; ++index) {
+    const double ratio = static_cast<double>(index) /
+                         static_cast<double>(interpolation_steps);
+    const State interpolated{
+      from.x + ratio * (to.x - from.x),
+      from.y + ratio * (to.y - from.y),
+      common::geometry::normalizeAngle(from.yaw + ratio * yaw_delta)
+    };
+    if (!_isStateCollisionFree(interpolated, collision_model, footprint,
+                               inscribed_radius, circumscribed_radius)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool MPPIController::_isControlSequenceCollisionFree(
+    const State& initial_state, const std::vector<Control>& controls,
+    base_local_planner::CostmapModel& collision_model,
+    const std::vector<geometry_msgs::Point>& footprint,
+    double inscribed_radius, double circumscribed_radius) const {
+  State state = initial_state;
+  for (const Control& control : controls) {
+    const State previous_state = state;
+    _predictState(&state, control);
+    if (!_isMotionCollisionFree(previous_state, state, collision_model,
+                                footprint, inscribed_radius,
+                                circumscribed_radius)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void MPPIController::_predictState(State* state, const Control& control) const {

@@ -15,12 +15,17 @@
 #include <string>
 #include <vector>
 
+#include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_core/base_local_planner.h>
 #include <tf2_ros/buffer.h>
 
 #include "controller/controller.h"
+
+namespace base_local_planner {
+class CostmapModel;
+}
 
 namespace rmp::controller {
 /**
@@ -67,7 +72,29 @@ private:
   bool _optimizeControlSequence(
       const State& initial_state, const Control& current_control,
       const std::vector<geometry_msgs::PoseStamped>& reference_plan,
-      std::size_t* valid_sample_count);
+      base_local_planner::CostmapModel& collision_model,
+      const std::vector<geometry_msgs::Point>& footprint,
+      double inscribed_radius, double circumscribed_radius,
+      std::size_t* valid_sample_count,
+      std::size_t* collision_rejection_count);
+
+  bool _isStateCollisionFree(
+      const State& state,
+      base_local_planner::CostmapModel& collision_model,
+      const std::vector<geometry_msgs::Point>& footprint,
+      double inscribed_radius, double circumscribed_radius) const;
+
+  bool _isMotionCollisionFree(
+      const State& from, const State& to,
+      base_local_planner::CostmapModel& collision_model,
+      const std::vector<geometry_msgs::Point>& footprint,
+      double inscribed_radius, double circumscribed_radius) const;
+
+  bool _isControlSequenceCollisionFree(
+      const State& initial_state, const std::vector<Control>& controls,
+      base_local_planner::CostmapModel& collision_model,
+      const std::vector<geometry_msgs::Point>& footprint,
+      double inscribed_radius, double circumscribed_radius) const;
 
   void _predictState(State* state, const Control& control) const;
 
@@ -96,6 +123,7 @@ private:
   bool initialized_;
   bool goal_reached_;
   bool has_goal_;
+  bool footprint_logged_;
   tf2_ros::Buffer* tf_;
   geometry_msgs::PoseStamped goal_pose_;
 
@@ -116,6 +144,8 @@ private:
   double control_delta_omega_weight_;
   double max_control_delta_v_;
   double max_control_delta_omega_;
+  double collision_check_resolution_;
+  bool treat_unknown_as_collision_;
   double goal_reset_distance_;
   double goal_reset_angle_;
 
