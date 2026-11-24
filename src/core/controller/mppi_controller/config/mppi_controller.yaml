@@ -26,6 +26,12 @@ max_control_delta_omega: 0.30
 collision_check_resolution: 0.025
 treat_unknown_as_collision: true
 
+# RViz trajectory visualization
+visualization_enabled: true
+visualization_frequency: 5.0
+visualization_sample_count: 50
+visualization_rejected_count: 50
+
 # A periodic global replan keeps the warm start unless the goal changes by more
 # than either threshold.
 goal_reset_distance: 0.50

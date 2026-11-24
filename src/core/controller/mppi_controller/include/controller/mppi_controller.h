@@ -19,7 +19,10 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_core/base_local_planner.h>
+#include <nav_msgs/Path.h>
+#include <ros/ros.h>
 #include <tf2_ros/buffer.h>
+#include <visualization_msgs/Marker.h>
 
 #include "controller/controller.h"
 
@@ -76,7 +79,9 @@ private:
       const std::vector<geometry_msgs::Point>& footprint,
       double inscribed_radius, double circumscribed_radius,
       std::size_t* valid_sample_count,
-      std::size_t* collision_rejection_count);
+      std::size_t* collision_rejection_count,
+      std::vector<std::vector<State>>* sampled_trajectories,
+      std::vector<std::vector<State>>* rejected_trajectories);
 
   bool _isStateCollisionFree(
       const State& state,
@@ -119,13 +124,40 @@ private:
 
   void _shiftControlSequence();
 
+  bool _visualizationDue(const ros::Time& stamp) const;
+
+  void _publishVisualization(
+      const State& initial_state, const Control& current_control,
+      const std::vector<std::vector<State>>& sampled_trajectories,
+      const std::vector<std::vector<State>>& rejected_trajectories,
+      const std::string& frame_id, const ros::Time& stamp);
+
+  void _publishTrajectoryMarker(
+      const std::vector<std::vector<State>>& trajectories,
+      const std::string& marker_namespace, const std::string& frame_id,
+      const ros::Time& stamp, float red, float green, float blue, float alpha,
+      ros::Publisher* publisher) const;
+
+  nav_msgs::Path _buildOptimizedPath(
+      const State& initial_state, const Control& current_control,
+      const std::string& frame_id, const ros::Time& stamp) const;
+
+  void _clearVisualization();
+
 private:
   bool initialized_;
   bool goal_reached_;
   bool has_goal_;
   bool footprint_logged_;
+  bool visualization_enabled_;
+  bool visualization_active_;
   tf2_ros::Buffer* tf_;
   geometry_msgs::PoseStamped goal_pose_;
+  ros::Publisher sampled_trajectories_publisher_;
+  ros::Publisher rejected_trajectories_publisher_;
+  ros::Publisher optimized_trajectory_publisher_;
+  ros::Time last_visualization_time_;
+  std::string visualization_frame_;
 
   int sample_count_;
   int prediction_steps_;
@@ -146,6 +178,9 @@ private:
   double max_control_delta_omega_;
   double collision_check_resolution_;
   bool treat_unknown_as_collision_;
+  double visualization_frequency_;
+  int visualization_sample_count_;
+  int visualization_rejected_count_;
   double goal_reset_distance_;
   double goal_reset_angle_;
 

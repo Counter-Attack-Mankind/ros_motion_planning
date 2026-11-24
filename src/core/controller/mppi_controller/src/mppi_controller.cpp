@@ -19,6 +19,7 @@
 #include <nav_msgs/Odometry.h>
 #include <pluginlib/class_list_macros.h>
 #include <tf2/exceptions.h>
+#include <tf2/LinearMath/Quaternion.h>
 #include <tf2/utils.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
@@ -40,6 +41,8 @@ MPPIController::MPPIController()
   , goal_reached_(false)
   , has_goal_(false)
   , footprint_logged_(false)
+  , visualization_enabled_(true)
+  , visualization_active_(false)
   , tf_(nullptr)
   , sample_count_(200)
   , prediction_steps_(20)
@@ -59,6 +62,9 @@ MPPIController::MPPIController()
   , max_control_delta_omega_(0.3)
   , collision_check_resolution_(0.025)
   , treat_unknown_as_collision_(true)
+  , visualization_frequency_(5.0)
+  , visualization_sample_count_(50)
+  , visualization_rejected_count_(50)
   , goal_reset_distance_(0.5)
   , goal_reset_angle_(0.5)
   , random_generator_(random_seed_) {
@@ -95,6 +101,14 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
   global_plan_.clear();
   random_generator_.seed(static_cast<std::mt19937::result_type>(random_seed_));
   _resetControlSequence();
+  if (visualization_enabled_) {
+    sampled_trajectories_publisher_ = private_nh.advertise<
+        visualization_msgs::Marker>("sampled_trajectories", 1);
+    rejected_trajectories_publisher_ = private_nh.advertise<
+        visualization_msgs::Marker>("rejected_trajectories", 1);
+    optimized_trajectory_publisher_ =
+        private_nh.advertise<nav_msgs::Path>("optimized_trajectory", 1);
+  }
   initialized_ = true;
 
   R_INFO << "MPPI Controller initialized: samples=" << sample_count_
@@ -103,7 +117,9 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
          << ", dt=" << control_dt_
          << " s, collision interpolation=" << collision_check_resolution_
          << " m, unknown space="
-         << (treat_unknown_as_collision_ ? "blocked" : "allowed") << ".";
+         << (treat_unknown_as_collision_ ? "blocked" : "allowed")
+         << ", visualization="
+         << (visualization_enabled_ ? "enabled" : "disabled") << ".";
 }
 
 bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
@@ -139,6 +155,15 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                    collision_check_resolution_);
   private_nh.param("treat_unknown_as_collision", treat_unknown_as_collision_,
                    treat_unknown_as_collision_);
+  private_nh.param("visualization_enabled", visualization_enabled_,
+                   visualization_enabled_);
+  private_nh.param("visualization_frequency", visualization_frequency_,
+                   visualization_frequency_);
+  private_nh.param("visualization_sample_count", visualization_sample_count_,
+                   visualization_sample_count_);
+  private_nh.param("visualization_rejected_count",
+                   visualization_rejected_count_,
+                   visualization_rejected_count_);
   private_nh.param("goal_reset_distance", goal_reset_distance_,
                    goal_reset_distance_);
   private_nh.param("goal_reset_angle", goal_reset_angle_, goal_reset_angle_);
@@ -156,6 +181,10 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                             max_control_delta_omega_ > 0.0 &&
                             std::isfinite(collision_check_resolution_) &&
                             collision_check_resolution_ > 0.0 &&
+                            std::isfinite(visualization_frequency_) &&
+                            visualization_frequency_ > 0.0 &&
+                            visualization_sample_count_ >= 0 &&
+                            visualization_rejected_count_ >= 0 &&
                             std::isfinite(goal_reset_distance_) &&
                             std::isfinite(goal_reset_angle_) &&
                             goal_reset_distance_ >= 0.0 &&
@@ -187,6 +216,7 @@ bool MPPIController::setPlan(
     has_goal_ = false;
     goal_reached_ = false;
     _resetControlSequence();
+    _clearVisualization();
     R_WARN << "MPPI Controller rejected an empty global plan.";
     return false;
   }
@@ -196,6 +226,7 @@ bool MPPIController::setPlan(
     global_plan_.clear();
     has_goal_ = false;
     goal_reached_ = false;
+    _clearVisualization();
     R_WARN << "MPPI Controller rejected a global plan with an empty frame ID.";
     return false;
   }
@@ -214,6 +245,9 @@ bool MPPIController::setPlan(
 
   if (reset_controls) {
     _resetControlSequence();
+  }
+  if (goal_changed) {
+    _clearVisualization();
   }
 
   ROS_INFO_THROTTLE(
@@ -254,6 +288,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   }
 
   if (global_plan_.empty() || !has_goal_) {
+    _clearVisualization();
     ROS_WARN_THROTTLE(
         1.0, "MPPI Controller has no global plan; commanding zero velocity.");
     return false;
@@ -265,6 +300,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
                                  base_odom.twist.twist.angular.z };
   if (!std::isfinite(current_control.v) ||
       !std::isfinite(current_control.omega)) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(1.0,
                        "MPPI Controller received non-finite odometry velocity.");
     return false;
@@ -272,10 +308,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
 
   geometry_msgs::PoseStamped robot_pose_local;
   if (!costmap_ros_->getRobotPose(robot_pose_local)) {
+    _clearVisualization();
     ROS_WARN_THROTTLE(1.0, "MPPI Controller could not obtain the robot pose.");
     return false;
   }
   if (robot_pose_local.header.frame_id.empty()) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(
         1.0, "MPPI Controller received a robot pose with no frame ID.");
     return false;
@@ -286,6 +324,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
                              tf2::getYaw(robot_pose_local.pose.orientation) };
   if (!std::isfinite(initial_state.x) || !std::isfinite(initial_state.y) ||
       !std::isfinite(initial_state.yaw)) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(1.0,
                        "MPPI Controller received a non-finite robot pose.");
     return false;
@@ -298,6 +337,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
       costmap_ros_->getRobotFootprint();
   if (local_costmap == nullptr || layered_costmap == nullptr ||
       footprint.size() < 3) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(
         1.0,
         "MPPI Controller has no valid runtime local-costmap footprint.");
@@ -308,6 +348,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   const double circumscribed_radius = layered_costmap->getCircumscribedRadius();
   if (!std::isfinite(inscribed_radius) || inscribed_radius < 0.0 ||
       !std::isfinite(circumscribed_radius) || circumscribed_radius < 0.0) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(
         1.0, "MPPI Controller received invalid local-costmap footprint radii.");
     return false;
@@ -333,11 +374,13 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
         "MPPI Controller robot footprint is in collision, unknown space, or "
         "outside the local costmap; commanding zero velocity.");
     _resetControlSequence();
+    _clearVisualization();
     return false;
   }
 
   const std::string plan_frame = global_plan_.front().header.frame_id;
   if (plan_frame.empty()) {
+    _clearVisualization();
     ROS_ERROR_THROTTLE(1.0, "MPPI Controller received a plan with no frame ID.");
     return false;
   }
@@ -360,12 +403,14 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
                     goal_pose_local);
     }
   } catch (const tf2::TransformException& exception) {
+    _clearVisualization();
     ROS_WARN_THROTTLE(1.0, "MPPI Controller TF failure: %s", exception.what());
     return false;
   }
 
   if (shouldRotateToGoal(robot_pose_local, goal_pose_local)) {
     _resetControlSequence();
+    _clearVisualization();
     const double yaw_error = common::geometry::normalizeAngle(
         tf2::getYaw(goal_pose_local.pose.orientation) -
         tf2::getYaw(robot_pose_local.pose.orientation));
@@ -400,6 +445,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
 
   std::vector<geometry_msgs::PoseStamped> pruned_plan = prune(robot_pose_plan);
   if (pruned_plan.empty()) {
+    _clearVisualization();
     ROS_WARN_THROTTLE(1.0,
                       "MPPI Controller produced an empty pruned reference path.");
     return false;
@@ -408,17 +454,33 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   std::vector<geometry_msgs::PoseStamped> reference_plan;
   if (!_transformPlan(pruned_plan, robot_pose_local.header.frame_id,
                       &reference_plan)) {
+    _clearVisualization();
     return false;
   }
 
+  ros::Time visualization_stamp;
+  bool collect_visualization = false;
+  if (visualization_enabled_) {
+    visualization_stamp = ros::Time::now();
+    collect_visualization = _visualizationDue(visualization_stamp);
+  }
+  std::vector<std::vector<State>> sampled_trajectories;
+  std::vector<std::vector<State>> rejected_trajectories;
+  auto* sampled_trajectories_output =
+      collect_visualization ? &sampled_trajectories : nullptr;
+  auto* rejected_trajectories_output =
+      collect_visualization ? &rejected_trajectories : nullptr;
   std::size_t valid_sample_count = 0;
   std::size_t collision_rejection_count = 0;
   if (!_optimizeControlSequence(initial_state, current_control, reference_plan,
                                 collision_model, footprint, inscribed_radius,
                                 circumscribed_radius, &valid_sample_count,
-                                &collision_rejection_count) ||
+                                &collision_rejection_count,
+                                sampled_trajectories_output,
+                                rejected_trajectories_output) ||
       nominal_controls_.empty()) {
     _resetControlSequence();
+    _clearVisualization();
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - cycle_start)
@@ -443,6 +505,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   if (!std::isfinite(cmd_vel.linear.x) ||
       !std::isfinite(cmd_vel.angular.z)) {
     cmd_vel = geometry_msgs::Twist();
+    _clearVisualization();
     ROS_ERROR_THROTTLE(1.0,
                        "MPPI Controller generated a non-finite velocity command.");
     return false;
@@ -461,6 +524,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
           inscribed_radius, circumscribed_radius)) {
     cmd_vel = geometry_msgs::Twist();
     _resetControlSequence();
+    _clearVisualization();
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - cycle_start)
@@ -475,6 +539,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     return false;
   }
 
+  if (collect_visualization) {
+    _publishVisualization(initial_state, current_control,
+                          sampled_trajectories, rejected_trajectories,
+                          robot_pose_local.header.frame_id,
+                          visualization_stamp);
+  }
   _shiftControlSequence();
 
   const double elapsed_ms =
@@ -534,9 +604,26 @@ bool MPPIController::_optimizeControlSequence(
     const std::vector<geometry_msgs::Point>& footprint,
     double inscribed_radius, double circumscribed_radius,
     std::size_t* valid_sample_count,
-    std::size_t* collision_rejection_count) {
+    std::size_t* collision_rejection_count,
+    std::vector<std::vector<State>>* sampled_trajectories,
+    std::vector<std::vector<State>>* rejected_trajectories) {
   *valid_sample_count = 0;
   *collision_rejection_count = 0;
+  const std::size_t available_sample_count =
+      static_cast<std::size_t>(sample_count_) *
+      static_cast<std::size_t>(optimization_iterations_);
+  if (sampled_trajectories != nullptr) {
+    sampled_trajectories->clear();
+    sampled_trajectories->reserve(std::min(
+        static_cast<std::size_t>(visualization_sample_count_),
+        available_sample_count));
+  }
+  if (rejected_trajectories != nullptr) {
+    rejected_trajectories->clear();
+    rejected_trajectories->reserve(std::min(
+        static_cast<std::size_t>(visualization_rejected_count_),
+        available_sample_count));
+  }
   if (reference_plan.empty() || nominal_controls_.size() !=
                                     static_cast<std::size_t>(prediction_steps_)) {
     return false;
@@ -567,6 +654,18 @@ bool MPPIController::_optimizeControlSequence(
     for (int sample = 0; sample < sample_count_; ++sample) {
       State state = initial_state;
       Control previous_control = current_control;
+      const bool record_sample =
+          (sampled_trajectories != nullptr &&
+           sampled_trajectories->size() <
+               static_cast<std::size_t>(visualization_sample_count_)) ||
+          (rejected_trajectories != nullptr &&
+           rejected_trajectories->size() <
+               static_cast<std::size_t>(visualization_rejected_count_));
+      std::vector<State> sampled_states;
+      if (record_sample) {
+        sampled_states.reserve(static_cast<std::size_t>(prediction_steps_ + 1));
+        sampled_states.push_back(initial_state);
+      }
       std::size_t nearest_index =
           _nearestReferenceIndex(state, reference_plan, 0);
       double total_cost = 0.0;
@@ -595,11 +694,19 @@ bool MPPIController::_optimizeControlSequence(
           sample_valid = false;
           break;
         }
+        if (record_sample) {
+          sampled_states.push_back(state);
+        }
         if (!_isMotionCollisionFree(previous_state, state, collision_model,
                                     footprint, inscribed_radius,
                                     circumscribed_radius)) {
           sample_valid = false;
           ++total_collision_rejection_count;
+          if (rejected_trajectories != nullptr &&
+              rejected_trajectories->size() < static_cast<std::size_t>(
+                  visualization_rejected_count_)) {
+            rejected_trajectories->push_back(std::move(sampled_states));
+          }
           break;
         }
 
@@ -637,6 +744,11 @@ bool MPPIController::_optimizeControlSequence(
       if (std::isfinite(total_cost)) {
         sample_costs[sample] = total_cost;
         ++iteration_valid_sample_count;
+        if (sampled_trajectories != nullptr &&
+            sampled_trajectories->size() < static_cast<std::size_t>(
+                visualization_sample_count_)) {
+          sampled_trajectories->push_back(std::move(sampled_states));
+        }
       }
     }
 
@@ -708,6 +820,151 @@ bool MPPIController::_optimizeControlSequence(
   *valid_sample_count = total_valid_sample_count;
   *collision_rejection_count = total_collision_rejection_count;
   return final_valid_sample_count > 0;
+}
+
+bool MPPIController::_visualizationDue(const ros::Time& stamp) const {
+  if (!visualization_enabled_) {
+    return false;
+  }
+  if (last_visualization_time_.isZero() ||
+      stamp < last_visualization_time_) {
+    return true;
+  }
+  return (stamp - last_visualization_time_).toSec() >=
+         1.0 / visualization_frequency_;
+}
+
+void MPPIController::_publishVisualization(
+    const State& initial_state, const Control& current_control,
+    const std::vector<std::vector<State>>& sampled_trajectories,
+    const std::vector<std::vector<State>>& rejected_trajectories,
+    const std::string& frame_id, const ros::Time& stamp) {
+  const nav_msgs::Path optimized_path =
+      _buildOptimizedPath(initial_state, current_control, frame_id, stamp);
+  if (optimized_path.poses.empty()) {
+    _clearVisualization();
+    ROS_WARN_THROTTLE(
+        1.0, "MPPI Controller could not build a finite visualization path.");
+    return;
+  }
+
+  _publishTrajectoryMarker(sampled_trajectories, "mppi_sampled_trajectories",
+                           frame_id, stamp, 0.0F, 0.35F, 1.0F, 0.2F,
+                           &sampled_trajectories_publisher_);
+  _publishTrajectoryMarker(rejected_trajectories,
+                           "mppi_rejected_trajectories", frame_id, stamp,
+                           1.0F, 0.0F, 0.0F, 0.35F,
+                           &rejected_trajectories_publisher_);
+  optimized_trajectory_publisher_.publish(optimized_path);
+
+  last_visualization_time_ = stamp;
+  visualization_frame_ = frame_id;
+  visualization_active_ = true;
+}
+
+void MPPIController::_publishTrajectoryMarker(
+    const std::vector<std::vector<State>>& trajectories,
+    const std::string& marker_namespace, const std::string& frame_id,
+    const ros::Time& stamp, float red, float green, float blue, float alpha,
+    ros::Publisher* publisher) const {
+  visualization_msgs::Marker marker;
+  marker.header.frame_id = frame_id;
+  marker.header.stamp = stamp;
+  marker.ns = marker_namespace;
+  marker.id = 0;
+  marker.type = visualization_msgs::Marker::LINE_LIST;
+  marker.action = trajectories.empty() ? visualization_msgs::Marker::DELETE :
+                                         visualization_msgs::Marker::ADD;
+  marker.pose.orientation.w = 1.0;
+  marker.scale.x = 0.01;
+  marker.color.r = red;
+  marker.color.g = green;
+  marker.color.b = blue;
+  marker.color.a = alpha;
+
+  if (!trajectories.empty()) {
+    std::size_t segment_count = 0;
+    for (const auto& trajectory : trajectories) {
+      if (trajectory.size() > 1) {
+        segment_count += trajectory.size() - 1;
+      }
+    }
+    marker.points.reserve(segment_count * 2);
+    for (const auto& trajectory : trajectories) {
+      for (std::size_t index = 1; index < trajectory.size(); ++index) {
+        geometry_msgs::Point from;
+        from.x = trajectory[index - 1].x;
+        from.y = trajectory[index - 1].y;
+        geometry_msgs::Point to;
+        to.x = trajectory[index].x;
+        to.y = trajectory[index].y;
+        marker.points.push_back(from);
+        marker.points.push_back(to);
+      }
+    }
+  }
+  publisher->publish(marker);
+}
+
+nav_msgs::Path MPPIController::_buildOptimizedPath(
+    const State& initial_state, const Control& current_control,
+    const std::string& frame_id, const ros::Time& stamp) const {
+  nav_msgs::Path path;
+  path.header.frame_id = frame_id;
+  path.header.stamp = stamp;
+  path.poses.reserve(nominal_controls_.size() + 1);
+
+  State state = initial_state;
+  Control previous_control = current_control;
+  for (std::size_t index = 0; index <= nominal_controls_.size(); ++index) {
+    if (!std::isfinite(state.x) || !std::isfinite(state.y) ||
+        !std::isfinite(state.yaw)) {
+      path.poses.clear();
+      return path;
+    }
+
+    geometry_msgs::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = state.x;
+    pose.pose.position.y = state.y;
+    tf2::Quaternion orientation;
+    orientation.setRPY(0.0, 0.0, state.yaw);
+    pose.pose.orientation = tf2::toMsg(orientation);
+    path.poses.push_back(std::move(pose));
+
+    if (index < nominal_controls_.size()) {
+      const Control projected_control =
+          _projectControl(nominal_controls_[index], previous_control);
+      _predictState(&state, projected_control);
+      previous_control = projected_control;
+    }
+  }
+  return path;
+}
+
+void MPPIController::_clearVisualization() {
+  if (!visualization_enabled_ || !visualization_active_) {
+    return;
+  }
+
+  const ros::Time stamp = ros::Time::now();
+  visualization_msgs::Marker marker;
+  marker.header.frame_id = visualization_frame_;
+  marker.header.stamp = stamp;
+  marker.id = 0;
+  marker.action = visualization_msgs::Marker::DELETE;
+
+  marker.ns = "mppi_sampled_trajectories";
+  sampled_trajectories_publisher_.publish(marker);
+  marker.ns = "mppi_rejected_trajectories";
+  rejected_trajectories_publisher_.publish(marker);
+
+  nav_msgs::Path empty_path;
+  empty_path.header.frame_id = visualization_frame_;
+  empty_path.header.stamp = stamp;
+  optimized_trajectory_publisher_.publish(empty_path);
+  visualization_active_ = false;
+  last_visualization_time_ = ros::Time(0);
 }
 
 bool MPPIController::_isStateCollisionFree(
