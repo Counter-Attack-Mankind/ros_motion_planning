@@ -1,6 +1,6 @@
 # Sampling and prediction
 sample_count: 200
-prediction_steps: 20
+prediction_steps: 60
 optimization_iterations: 1
 random_seed: 42
 
@@ -25,11 +25,12 @@ max_control_delta_omega: 0.30
 # Hard collision checking uses the runtime local-costmap footprint.
 collision_check_resolution: 0.025
 treat_unknown_as_collision: true
+collision_safety_horizon: 1.0
 
 # RViz trajectory visualization
 visualization_enabled: true
 visualization_frequency: 5.0
-visualization_sample_count: 50
+visualization_sample_count: 100
 visualization_rejected_count: 50
 
 # A periodic global replan keeps the warm start unless the goal changes by more

@@ -65,6 +65,12 @@ private:
     double omega{ 0.0 };
   };
 
+  enum class CollisionCheckResult {
+    kFree,
+    kCollision,
+    kOutsideMap
+  };
+
   bool _loadParameters(ros::NodeHandle& private_nh);
 
   bool _transformPlan(
@@ -80,16 +86,18 @@ private:
       double inscribed_radius, double circumscribed_radius,
       std::size_t* valid_sample_count,
       std::size_t* collision_rejection_count,
+      std::size_t* safety_rejection_count,
+      std::size_t* unverified_sample_count,
       std::vector<std::vector<State>>* sampled_trajectories,
       std::vector<std::vector<State>>* rejected_trajectories);
 
-  bool _isStateCollisionFree(
+  CollisionCheckResult _checkStateCollision(
       const State& state,
       base_local_planner::CostmapModel& collision_model,
       const std::vector<geometry_msgs::Point>& footprint,
       double inscribed_radius, double circumscribed_radius) const;
 
-  bool _isMotionCollisionFree(
+  CollisionCheckResult _checkMotionCollision(
       const State& from, const State& to,
       base_local_planner::CostmapModel& collision_model,
       const std::vector<geometry_msgs::Point>& footprint,
@@ -178,6 +186,7 @@ private:
   double max_control_delta_omega_;
   double collision_check_resolution_;
   bool treat_unknown_as_collision_;
+  double collision_safety_horizon_;
   double visualization_frequency_;
   int visualization_sample_count_;
   int visualization_rejected_count_;

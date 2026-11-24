@@ -45,7 +45,7 @@ MPPIController::MPPIController()
   , visualization_active_(false)
   , tf_(nullptr)
   , sample_count_(200)
-  , prediction_steps_(20)
+  , prediction_steps_(60)
   , optimization_iterations_(1)
   , random_seed_(42)
   , noise_std_v_(0.2)
@@ -62,8 +62,9 @@ MPPIController::MPPIController()
   , max_control_delta_omega_(0.3)
   , collision_check_resolution_(0.025)
   , treat_unknown_as_collision_(true)
+  , collision_safety_horizon_(1.0)
   , visualization_frequency_(5.0)
-  , visualization_sample_count_(50)
+  , visualization_sample_count_(100)
   , visualization_rejected_count_(50)
   , goal_reset_distance_(0.5)
   , goal_reset_angle_(0.5)
@@ -118,6 +119,7 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
          << " s, collision interpolation=" << collision_check_resolution_
          << " m, unknown space="
          << (treat_unknown_as_collision_ ? "blocked" : "allowed")
+         << ", verified safety horizon=" << collision_safety_horizon_ << " s"
          << ", visualization="
          << (visualization_enabled_ ? "enabled" : "disabled") << ".";
 }
@@ -155,6 +157,8 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                    collision_check_resolution_);
   private_nh.param("treat_unknown_as_collision", treat_unknown_as_collision_,
                    treat_unknown_as_collision_);
+  private_nh.param("collision_safety_horizon", collision_safety_horizon_,
+                   collision_safety_horizon_);
   private_nh.param("visualization_enabled", visualization_enabled_,
                    visualization_enabled_);
   private_nh.param("visualization_frequency", visualization_frequency_,
@@ -177,10 +181,13 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                               temperature_ > kNumericalEpsilon;
   const bool limits_valid = std::isfinite(max_control_delta_v_) &&
                             std::isfinite(max_control_delta_omega_) &&
+                            std::isfinite(control_dt_) && control_dt_ > 0.0 &&
                             max_control_delta_v_ > 0.0 &&
                             max_control_delta_omega_ > 0.0 &&
                             std::isfinite(collision_check_resolution_) &&
                             collision_check_resolution_ > 0.0 &&
+                            std::isfinite(collision_safety_horizon_) &&
+                            collision_safety_horizon_ > 0.0 &&
                             std::isfinite(visualization_frequency_) &&
                             visualization_frequency_ > 0.0 &&
                             visualization_sample_count_ >= 0 &&
@@ -367,8 +374,9 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   // robot_pose_local and every predicted state remain in the local costmap's
   // global frame; CostmapModel rotates/translates this robot-frame footprint.
   base_local_planner::CostmapModel collision_model(*local_costmap);
-  if (!_isStateCollisionFree(initial_state, collision_model, footprint,
-                             inscribed_radius, circumscribed_radius)) {
+  if (_checkStateCollision(initial_state, collision_model, footprint,
+                           inscribed_radius, circumscribed_radius) !=
+      CollisionCheckResult::kFree) {
     ROS_WARN_THROTTLE(
         1.0,
         "MPPI Controller robot footprint is in collision, unknown space, or "
@@ -430,9 +438,10 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
 
     State rotated_state = initial_state;
     _predictState(&rotated_state, Control{ 0.0, cmd_vel.angular.z });
-    if (!_isMotionCollisionFree(initial_state, rotated_state, collision_model,
-                                footprint, inscribed_radius,
-                                circumscribed_radius)) {
+    if (_checkMotionCollision(initial_state, rotated_state, collision_model,
+                              footprint, inscribed_radius,
+                              circumscribed_radius) !=
+        CollisionCheckResult::kFree) {
       cmd_vel = geometry_msgs::Twist();
       ROS_WARN_THROTTLE(
           1.0,
@@ -472,10 +481,14 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
       collect_visualization ? &rejected_trajectories : nullptr;
   std::size_t valid_sample_count = 0;
   std::size_t collision_rejection_count = 0;
+  std::size_t safety_rejection_count = 0;
+  std::size_t unverified_sample_count = 0;
   if (!_optimizeControlSequence(initial_state, current_control, reference_plan,
                                 collision_model, footprint, inscribed_radius,
                                 circumscribed_radius, &valid_sample_count,
                                 &collision_rejection_count,
+                                &safety_rejection_count,
+                                &unverified_sample_count,
                                 sampled_trajectories_output,
                                 rejected_trajectories_output) ||
       nominal_controls_.empty()) {
@@ -488,10 +501,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     ROS_WARN_THROTTLE(
         1.0,
         "MPPI Controller has no feasible weighted control sequence "
-        "(valid=%zu/%d, collision rejected=%zu, cycle=%.3f ms); commanding "
-        "zero velocity.",
+        "(valid=%zu/%d, collision rejected=%zu, unverified-prefix "
+        "rejected=%zu, unverified-tail=%zu, cycle=%.3f ms); commanding zero "
+        "velocity.",
         valid_sample_count, sample_count_ * optimization_iterations_,
-        collision_rejection_count, elapsed_ms);
+        collision_rejection_count, safety_rejection_count,
+        unverified_sample_count, elapsed_ms);
     return false;
   }
 
@@ -533,9 +548,11 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
         1.0,
         "MPPI Controller rejected the optimized command because its final "
         "predicted trajectory is unsafe (valid=%zu/%d, collision rejected=%zu, "
-        "cycle=%.3f ms); commanding zero velocity.",
+        "unverified-prefix rejected=%zu, unverified-tail=%zu, cycle=%.3f ms); "
+        "commanding zero velocity.",
         valid_sample_count, sample_count_ * optimization_iterations_,
-        collision_rejection_count, elapsed_ms);
+        collision_rejection_count, safety_rejection_count,
+        unverified_sample_count, elapsed_ms);
     return false;
   }
 
@@ -554,10 +571,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   ROS_INFO_THROTTLE(
       2.0,
       "MPPI cycle %.3f ms, valid samples %zu/%d, collision rejected %zu, "
-      "command v=%.3f m/s, omega=%.3f rad/s.",
+      "unverified-prefix rejected %zu, unverified-tail %zu, command v=%.3f "
+      "m/s, omega=%.3f rad/s.",
       elapsed_ms, valid_sample_count,
       sample_count_ * optimization_iterations_,
-      collision_rejection_count, cmd_vel.linear.x, cmd_vel.angular.z);
+      collision_rejection_count, safety_rejection_count,
+      unverified_sample_count, cmd_vel.linear.x, cmd_vel.angular.z);
   return true;
 }
 
@@ -605,10 +624,17 @@ bool MPPIController::_optimizeControlSequence(
     double inscribed_radius, double circumscribed_radius,
     std::size_t* valid_sample_count,
     std::size_t* collision_rejection_count,
+    std::size_t* safety_rejection_count,
+    std::size_t* unverified_sample_count,
     std::vector<std::vector<State>>* sampled_trajectories,
     std::vector<std::vector<State>>* rejected_trajectories) {
   *valid_sample_count = 0;
   *collision_rejection_count = 0;
+  *safety_rejection_count = 0;
+  *unverified_sample_count = 0;
+  const std::size_t required_verified_steps = std::max<std::size_t>(
+      1, static_cast<std::size_t>(
+             std::ceil(collision_safety_horizon_ / control_dt_)));
   const std::size_t available_sample_count =
       static_cast<std::size_t>(sample_count_) *
       static_cast<std::size_t>(optimization_iterations_);
@@ -643,6 +669,8 @@ bool MPPIController::_optimizeControlSequence(
   std::size_t final_valid_sample_count = 0;
   std::size_t total_valid_sample_count = 0;
   std::size_t total_collision_rejection_count = 0;
+  std::size_t total_safety_rejection_count = 0;
+  std::size_t total_unverified_sample_count = 0;
 
   for (int iteration = 0; iteration < optimization_iterations_; ++iteration) {
     std::vector<std::vector<Control>> sampled_controls(
@@ -670,6 +698,7 @@ bool MPPIController::_optimizeControlSequence(
           _nearestReferenceIndex(state, reference_plan, 0);
       double total_cost = 0.0;
       bool sample_valid = true;
+      bool sample_has_unverified_tail = false;
 
       for (int step = 0; step < prediction_steps_; ++step) {
         const double noise_v =
@@ -697,9 +726,10 @@ bool MPPIController::_optimizeControlSequence(
         if (record_sample) {
           sampled_states.push_back(state);
         }
-        if (!_isMotionCollisionFree(previous_state, state, collision_model,
-                                    footprint, inscribed_radius,
-                                    circumscribed_radius)) {
+        const CollisionCheckResult collision_result = _checkMotionCollision(
+            previous_state, state, collision_model, footprint,
+            inscribed_radius, circumscribed_radius);
+        if (collision_result == CollisionCheckResult::kCollision) {
           sample_valid = false;
           ++total_collision_rejection_count;
           if (rejected_trajectories != nullptr &&
@@ -708,6 +738,17 @@ bool MPPIController::_optimizeControlSequence(
             rejected_trajectories->push_back(std::move(sampled_states));
           }
           break;
+        }
+        if (collision_result == CollisionCheckResult::kOutsideMap) {
+          // A map-external state is not declared collision-free. The verified
+          // prefix is mandatory; an unverified tail keeps only the existing
+          // path/control costs and is reconsidered as the rolling map moves.
+          if (static_cast<std::size_t>(step) < required_verified_steps) {
+            sample_valid = false;
+            ++total_safety_rejection_count;
+            break;
+          }
+          sample_has_unverified_tail = true;
         }
 
         nearest_index =
@@ -744,6 +785,9 @@ bool MPPIController::_optimizeControlSequence(
       if (std::isfinite(total_cost)) {
         sample_costs[sample] = total_cost;
         ++iteration_valid_sample_count;
+        if (sample_has_unverified_tail) {
+          ++total_unverified_sample_count;
+        }
         if (sampled_trajectories != nullptr &&
             sampled_trajectories->size() < static_cast<std::size_t>(
                 visualization_sample_count_)) {
@@ -756,6 +800,8 @@ bool MPPIController::_optimizeControlSequence(
     if (iteration_valid_sample_count == 0) {
       *valid_sample_count = total_valid_sample_count;
       *collision_rejection_count = total_collision_rejection_count;
+      *safety_rejection_count = total_safety_rejection_count;
+      *unverified_sample_count = total_unverified_sample_count;
       return false;
     }
 
@@ -768,6 +814,8 @@ bool MPPIController::_optimizeControlSequence(
     if (!std::isfinite(minimum_cost)) {
       *valid_sample_count = total_valid_sample_count;
       *collision_rejection_count = total_collision_rejection_count;
+      *safety_rejection_count = total_safety_rejection_count;
+      *unverified_sample_count = total_unverified_sample_count;
       return false;
     }
 
@@ -791,6 +839,8 @@ bool MPPIController::_optimizeControlSequence(
     if (!std::isfinite(weight_sum) || weight_sum <= kNumericalEpsilon) {
       *valid_sample_count = total_valid_sample_count;
       *collision_rejection_count = total_collision_rejection_count;
+      *safety_rejection_count = total_safety_rejection_count;
+      *unverified_sample_count = total_unverified_sample_count;
       return false;
     }
 
@@ -819,6 +869,8 @@ bool MPPIController::_optimizeControlSequence(
 
   *valid_sample_count = total_valid_sample_count;
   *collision_rejection_count = total_collision_rejection_count;
+  *safety_rejection_count = total_safety_rejection_count;
+  *unverified_sample_count = total_unverified_sample_count;
   return final_valid_sample_count > 0;
 }
 
@@ -967,14 +1019,14 @@ void MPPIController::_clearVisualization() {
   last_visualization_time_ = ros::Time(0);
 }
 
-bool MPPIController::_isStateCollisionFree(
+MPPIController::CollisionCheckResult MPPIController::_checkStateCollision(
     const State& state,
     base_local_planner::CostmapModel& collision_model,
     const std::vector<geometry_msgs::Point>& footprint,
     double inscribed_radius, double circumscribed_radius) const {
   if (!std::isfinite(state.x) || !std::isfinite(state.y) ||
       !std::isfinite(state.yaw)) {
-    return false;
+    return CollisionCheckResult::kCollision;
   }
 
   const costmap_2d::Costmap2D* local_costmap = costmap_ros_->getCostmap();
@@ -982,35 +1034,42 @@ bool MPPIController::_isStateCollisionFree(
   unsigned int map_y = 0;
   if (local_costmap == nullptr ||
       !local_costmap->worldToMap(state.x, state.y, map_x, map_y)) {
-    return false;
+    return local_costmap == nullptr ? CollisionCheckResult::kCollision :
+                                      CollisionCheckResult::kOutsideMap;
   }
   const unsigned char center_cost = local_costmap->getCost(map_x, map_y);
   if (center_cost == costmap_2d::NO_INFORMATION &&
       treat_unknown_as_collision_) {
-    return false;
+    return CollisionCheckResult::kCollision;
   }
   if (center_cost != costmap_2d::NO_INFORMATION &&
       center_cost >= costmap_2d::INSCRIBED_INFLATED_OBSTACLE) {
-    return false;
+    return CollisionCheckResult::kCollision;
   }
 
   const double footprint_cost = collision_model.footprintCost(
       state.x, state.y, state.yaw, footprint, inscribed_radius,
       circumscribed_radius);
   if (!std::isfinite(footprint_cost)) {
-    return false;
+    return CollisionCheckResult::kCollision;
   }
   if (footprint_cost >= 0.0) {
-    return true;
+    return CollisionCheckResult::kFree;
   }
 
-  // CostmapModel reports -2 for unknown space. Lethal obstacles (-1), map
-  // bounds violations (-3), and any unrecognized negative status are always
-  // rejected.
-  return footprint_cost == -2.0 && !treat_unknown_as_collision_;
+  // CostmapModel reports -3 when any footprint point is outside the map. This
+  // is distinct from a collision so a long-horizon tail can remain explicitly
+  // unverified while the near-term safety horizon remains mandatory.
+  if (footprint_cost == -3.0) {
+    return CollisionCheckResult::kOutsideMap;
+  }
+  if (footprint_cost == -2.0 && !treat_unknown_as_collision_) {
+    return CollisionCheckResult::kFree;
+  }
+  return CollisionCheckResult::kCollision;
 }
 
-bool MPPIController::_isMotionCollisionFree(
+MPPIController::CollisionCheckResult MPPIController::_checkMotionCollision(
     const State& from, const State& to,
     base_local_planner::CostmapModel& collision_model,
     const std::vector<geometry_msgs::Point>& footprint,
@@ -1024,6 +1083,7 @@ bool MPPIController::_isMotionCollisionFree(
       1, static_cast<std::size_t>(
              std::ceil(maximum_sweep / collision_check_resolution_)));
 
+  CollisionCheckResult motion_result = CollisionCheckResult::kFree;
   for (std::size_t index = 1; index <= interpolation_steps; ++index) {
     const double ratio = static_cast<double>(index) /
                          static_cast<double>(interpolation_steps);
@@ -1032,12 +1092,17 @@ bool MPPIController::_isMotionCollisionFree(
       from.y + ratio * (to.y - from.y),
       common::geometry::normalizeAngle(from.yaw + ratio * yaw_delta)
     };
-    if (!_isStateCollisionFree(interpolated, collision_model, footprint,
-                               inscribed_radius, circumscribed_radius)) {
-      return false;
+    const CollisionCheckResult state_result = _checkStateCollision(
+        interpolated, collision_model, footprint, inscribed_radius,
+        circumscribed_radius);
+    if (state_result == CollisionCheckResult::kCollision) {
+      return CollisionCheckResult::kCollision;
+    }
+    if (state_result == CollisionCheckResult::kOutsideMap) {
+      motion_result = CollisionCheckResult::kOutsideMap;
     }
   }
-  return true;
+  return motion_result;
 }
 
 bool MPPIController::_isControlSequenceCollisionFree(
@@ -1046,12 +1111,18 @@ bool MPPIController::_isControlSequenceCollisionFree(
     const std::vector<geometry_msgs::Point>& footprint,
     double inscribed_radius, double circumscribed_radius) const {
   State state = initial_state;
-  for (const Control& control : controls) {
+  const std::size_t required_verified_steps = std::max<std::size_t>(
+      1, static_cast<std::size_t>(
+             std::ceil(collision_safety_horizon_ / control_dt_)));
+  for (std::size_t index = 0; index < controls.size(); ++index) {
     const State previous_state = state;
-    _predictState(&state, control);
-    if (!_isMotionCollisionFree(previous_state, state, collision_model,
-                                footprint, inscribed_radius,
-                                circumscribed_radius)) {
+    _predictState(&state, controls[index]);
+    const CollisionCheckResult collision_result = _checkMotionCollision(
+        previous_state, state, collision_model, footprint, inscribed_radius,
+        circumscribed_radius);
+    if (collision_result == CollisionCheckResult::kCollision ||
+        (collision_result == CollisionCheckResult::kOutsideMap &&
+         index < required_verified_steps)) {
       return false;
     }
   }
