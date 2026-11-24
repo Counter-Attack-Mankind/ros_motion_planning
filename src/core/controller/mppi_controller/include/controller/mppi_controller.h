@@ -190,6 +190,8 @@ private:
   int random_seed_;
   bool temporal_noise_enabled_;
   double temporal_noise_rho_;
+  bool temporal_noise_v_enabled_;
+  double temporal_noise_rho_v_;
   bool safety_fallback_enabled_;
   int safety_fallback_max_candidates_;
 

@@ -50,7 +50,9 @@ MPPIController::MPPIController()
   , optimization_iterations_(1)
   , random_seed_(42)
   , temporal_noise_enabled_(true)
-  , temporal_noise_rho_(0.8)
+  , temporal_noise_rho_(0.9)
+  , temporal_noise_v_enabled_(true)
+  , temporal_noise_rho_v_(0.8)
   , safety_fallback_enabled_(true)
   , safety_fallback_max_candidates_(5)
   , noise_std_v_(0.2)
@@ -128,6 +130,8 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
          << ", verified safety horizon=" << collision_safety_horizon_ << " s"
          << ", temporal noise="
          << (temporal_noise_enabled_ ? "enabled" : "disabled")
+         << ", temporal linear noise="
+         << (temporal_noise_v_enabled_ ? "enabled" : "disabled")
          << ", safety fallback="
          << (safety_fallback_enabled_ ? "enabled" : "disabled")
          << ", visualization="
@@ -144,6 +148,10 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                    temporal_noise_enabled_);
   private_nh.param("temporal_noise_rho", temporal_noise_rho_,
                    temporal_noise_rho_);
+  private_nh.param("temporal_noise_v_enabled", temporal_noise_v_enabled_,
+                   temporal_noise_v_enabled_);
+  private_nh.param("temporal_noise_rho_v", temporal_noise_rho_v_,
+                   temporal_noise_rho_v_);
   private_nh.param("safety_fallback_enabled", safety_fallback_enabled_,
                    safety_fallback_enabled_);
   private_nh.param("safety_fallback_max_candidates",
@@ -207,7 +215,10 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                               temperature_ > kNumericalEpsilon &&
                               std::isfinite(temporal_noise_rho_) &&
                               temporal_noise_rho_ >= 0.0 &&
-                              temporal_noise_rho_ < 1.0;
+                              temporal_noise_rho_ < 1.0 &&
+                              std::isfinite(temporal_noise_rho_v_) &&
+                              temporal_noise_rho_v_ >= 0.0 &&
+                              temporal_noise_rho_v_ < 1.0;
   const bool limits_valid = std::isfinite(max_control_delta_v_) &&
                             std::isfinite(max_control_delta_omega_) &&
                             std::isfinite(control_dt_) && control_dt_ > 0.0 &&
@@ -733,6 +744,8 @@ bool MPPIController::_optimizeControlSequence(
   std::normal_distribution<double> normal_distribution(0.0, 1.0);
   const double temporal_noise_scale = std::sqrt(std::max(
       0.0, 1.0 - temporal_noise_rho_ * temporal_noise_rho_));
+  const double temporal_noise_scale_v = std::sqrt(std::max(
+      0.0, 1.0 - temporal_noise_rho_v_ * temporal_noise_rho_v_));
   std::size_t final_valid_sample_count = 0;
   std::size_t total_valid_sample_count = 0;
   std::size_t total_collision_rejection_count = 0;
@@ -749,6 +762,7 @@ bool MPPIController::_optimizeControlSequence(
     for (int sample = 0; sample < sample_count_; ++sample) {
       State state = initial_state;
       Control previous_control = current_control;
+      double previous_noise_v = 0.0;
       double previous_noise_omega = 0.0;
       const bool record_sample =
           (sampled_trajectories != nullptr &&
@@ -770,9 +784,15 @@ bool MPPIController::_optimizeControlSequence(
       bool sample_has_unverified_tail = false;
 
       for (int step = 0; step < prediction_steps_; ++step) {
-        const double noise_v =
+        const double independent_noise_v =
             sample == 0 ? 0.0 :
                           noise_std_v_ * normal_distribution(random_generator_);
+        double noise_v = independent_noise_v;
+        if (sample != 0 && temporal_noise_v_enabled_ && step > 0) {
+          noise_v = temporal_noise_rho_v_ * previous_noise_v +
+                    temporal_noise_scale_v * independent_noise_v;
+        }
+        previous_noise_v = noise_v;
         const double independent_noise_omega =
             sample == 0 ?
                 0.0 :

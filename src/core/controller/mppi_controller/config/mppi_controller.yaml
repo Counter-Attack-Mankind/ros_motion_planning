@@ -4,7 +4,9 @@ prediction_steps: 60
 optimization_iterations: 1
 random_seed: 42
 temporal_noise_enabled: true
-temporal_noise_rho: 0.8
+temporal_noise_rho: 0.9
+temporal_noise_v_enabled: true
+temporal_noise_rho_v: 0.8
 safety_fallback_enabled: true
 safety_fallback_max_candidates: 5
 
