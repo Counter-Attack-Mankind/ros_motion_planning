@@ -103,6 +103,10 @@ private:
       const std::vector<geometry_msgs::Point>& footprint,
       double inscribed_radius, double circumscribed_radius) const;
 
+  double _normalizedObstacleCost(
+      const State& state,
+      const std::vector<geometry_msgs::Point>& footprint) const;
+
   bool _isControlSequenceCollisionFree(
       const State& initial_state, const std::vector<Control>& controls,
       base_local_planner::CostmapModel& collision_model,
@@ -135,7 +139,8 @@ private:
   bool _visualizationDue(const ros::Time& stamp) const;
 
   void _publishVisualization(
-      const State& initial_state, const Control& current_control,
+      const State& initial_state,
+      const std::vector<Control>& execution_controls,
       const std::vector<std::vector<State>>& sampled_trajectories,
       const std::vector<std::vector<State>>& rejected_trajectories,
       const std::string& frame_id, const ros::Time& stamp);
@@ -147,7 +152,8 @@ private:
       ros::Publisher* publisher) const;
 
   nav_msgs::Path _buildOptimizedPath(
-      const State& initial_state, const Control& current_control,
+      const State& initial_state,
+      const std::vector<Control>& execution_controls,
       const std::string& frame_id, const ros::Time& stamp) const;
 
   void _clearVisualization();
@@ -182,6 +188,7 @@ private:
   double control_omega_weight_;
   double control_delta_v_weight_;
   double control_delta_omega_weight_;
+  double obstacle_cost_weight_;
   double max_control_delta_v_;
   double max_control_delta_omega_;
   double collision_check_resolution_;

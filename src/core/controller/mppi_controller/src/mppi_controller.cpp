@@ -58,6 +58,7 @@ MPPIController::MPPIController()
   , control_omega_weight_(0.1)
   , control_delta_v_weight_(1.0)
   , control_delta_omega_weight_(0.2)
+  , obstacle_cost_weight_(10.0)
   , max_control_delta_v_(0.05)
   , max_control_delta_omega_(0.3)
   , collision_check_resolution_(0.025)
@@ -148,6 +149,8 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
                    control_delta_v_weight_);
   private_nh.param("control_delta_omega_weight", control_delta_omega_weight_,
                    control_delta_omega_weight_);
+  private_nh.param("obstacle_cost_weight", obstacle_cost_weight_,
+                   obstacle_cost_weight_);
 
   private_nh.param("max_control_delta_v", max_control_delta_v_,
                    max_control_delta_v_);
@@ -206,7 +209,8 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
       std::isfinite(control_delta_v_weight_) &&
       control_delta_v_weight_ >= 0.0 &&
       std::isfinite(control_delta_omega_weight_) &&
-      control_delta_omega_weight_ >= 0.0;
+      control_delta_omega_weight_ >= 0.0 &&
+      std::isfinite(obstacle_cost_weight_) && obstacle_cost_weight_ >= 0.0;
 
   return dimensions_valid && sampling_valid && limits_valid && weights_valid;
 }
@@ -503,7 +507,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
         "MPPI Controller has no feasible weighted control sequence "
         "(valid=%zu/%d, collision rejected=%zu, unverified-prefix "
         "rejected=%zu, unverified-tail=%zu, cycle=%.3f ms); commanding zero "
-        "velocity.",
+        "velocity and returning false to move_base for replanning/recovery.",
         valid_sample_count, sample_count_ * optimization_iterations_,
         collision_rejection_count, safety_rejection_count,
         unverified_sample_count, elapsed_ms);
@@ -557,7 +561,7 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   }
 
   if (collect_visualization) {
-    _publishVisualization(initial_state, current_control,
+    _publishVisualization(initial_state, execution_controls,
                           sampled_trajectories, rejected_trajectories,
                           robot_pose_local.header.frame_id,
                           visualization_stamp);
@@ -697,6 +701,7 @@ bool MPPIController::_optimizeControlSequence(
       std::size_t nearest_index =
           _nearestReferenceIndex(state, reference_plan, 0);
       double total_cost = 0.0;
+      double obstacle_cost_sum = 0.0;
       bool sample_valid = true;
       bool sample_has_unverified_tail = false;
 
@@ -751,6 +756,13 @@ bool MPPIController::_optimizeControlSequence(
           sample_has_unverified_tail = true;
         }
 
+        const double normalized_obstacle_cost =
+            collision_result == CollisionCheckResult::kOutsideMap ?
+                1.0 :
+                _normalizedObstacleCost(state, footprint);
+        obstacle_cost_sum +=
+            normalized_obstacle_cost * normalized_obstacle_cost;
+
         nearest_index =
             _nearestReferenceIndex(state, reference_plan, nearest_index);
         const double path_dx =
@@ -781,6 +793,8 @@ bool MPPIController::_optimizeControlSequence(
       const double remaining_path_distance =
           cumulative_distance.back() - cumulative_distance[nearest_index];
       total_cost += terminal_progress_weight_ * remaining_path_distance;
+      total_cost += obstacle_cost_weight_ * obstacle_cost_sum /
+                    static_cast<double>(prediction_steps_);
 
       if (std::isfinite(total_cost)) {
         sample_costs[sample] = total_cost;
@@ -887,12 +901,13 @@ bool MPPIController::_visualizationDue(const ros::Time& stamp) const {
 }
 
 void MPPIController::_publishVisualization(
-    const State& initial_state, const Control& current_control,
+    const State& initial_state,
+    const std::vector<Control>& execution_controls,
     const std::vector<std::vector<State>>& sampled_trajectories,
     const std::vector<std::vector<State>>& rejected_trajectories,
     const std::string& frame_id, const ros::Time& stamp) {
   const nav_msgs::Path optimized_path =
-      _buildOptimizedPath(initial_state, current_control, frame_id, stamp);
+      _buildOptimizedPath(initial_state, execution_controls, frame_id, stamp);
   if (optimized_path.poses.empty()) {
     _clearVisualization();
     ROS_WARN_THROTTLE(
@@ -959,16 +974,16 @@ void MPPIController::_publishTrajectoryMarker(
 }
 
 nav_msgs::Path MPPIController::_buildOptimizedPath(
-    const State& initial_state, const Control& current_control,
+    const State& initial_state,
+    const std::vector<Control>& execution_controls,
     const std::string& frame_id, const ros::Time& stamp) const {
   nav_msgs::Path path;
   path.header.frame_id = frame_id;
   path.header.stamp = stamp;
-  path.poses.reserve(nominal_controls_.size() + 1);
+  path.poses.reserve(execution_controls.size() + 1);
 
   State state = initial_state;
-  Control previous_control = current_control;
-  for (std::size_t index = 0; index <= nominal_controls_.size(); ++index) {
+  for (std::size_t index = 0; index <= execution_controls.size(); ++index) {
     if (!std::isfinite(state.x) || !std::isfinite(state.y) ||
         !std::isfinite(state.yaw)) {
       path.poses.clear();
@@ -984,11 +999,8 @@ nav_msgs::Path MPPIController::_buildOptimizedPath(
     pose.pose.orientation = tf2::toMsg(orientation);
     path.poses.push_back(std::move(pose));
 
-    if (index < nominal_controls_.size()) {
-      const Control projected_control =
-          _projectControl(nominal_controls_[index], previous_control);
-      _predictState(&state, projected_control);
-      previous_control = projected_control;
+    if (index < execution_controls.size()) {
+      _predictState(&state, execution_controls[index]);
     }
   }
   return path;
@@ -1067,6 +1079,48 @@ MPPIController::CollisionCheckResult MPPIController::_checkStateCollision(
     return CollisionCheckResult::kFree;
   }
   return CollisionCheckResult::kCollision;
+}
+
+double MPPIController::_normalizedObstacleCost(
+    const State& state,
+    const std::vector<geometry_msgs::Point>& footprint) const {
+  const costmap_2d::Costmap2D* local_costmap = costmap_ros_->getCostmap();
+  if (local_costmap == nullptr || !std::isfinite(state.x) ||
+      !std::isfinite(state.y) || !std::isfinite(state.yaw)) {
+    return 1.0;
+  }
+
+  unsigned char maximum_cost = costmap_2d::FREE_SPACE;
+  const auto include_cost = [&](double world_x, double world_y) {
+    unsigned int map_x = 0;
+    unsigned int map_y = 0;
+    if (!local_costmap->worldToMap(world_x, world_y, map_x, map_y)) {
+      return false;
+    }
+    maximum_cost =
+        std::max(maximum_cost, local_costmap->getCost(map_x, map_y));
+    return true;
+  };
+
+  if (!include_cost(state.x, state.y)) {
+    return 1.0;
+  }
+  const double cosine = std::cos(state.yaw);
+  const double sine = std::sin(state.yaw);
+  for (const geometry_msgs::Point& footprint_point : footprint) {
+    const double world_x = state.x + footprint_point.x * cosine -
+                           footprint_point.y * sine;
+    const double world_y = state.y + footprint_point.x * sine +
+                           footprint_point.y * cosine;
+    if (!include_cost(world_x, world_y)) {
+      return 1.0;
+    }
+  }
+
+  const double bounded_cost = std::min<double>(
+      maximum_cost, costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
+  return bounded_cost /
+         static_cast<double>(costmap_2d::INSCRIBED_INFLATED_OBSTACLE);
 }
 
 MPPIController::CollisionCheckResult MPPIController::_checkMotionCollision(

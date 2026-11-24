@@ -17,6 +17,7 @@ control_v_weight: 0.2
 control_omega_weight: 0.1
 control_delta_v_weight: 1.0
 control_delta_omega_weight: 0.2
+obstacle_cost_weight: 10.0
 
 # Per-control-step increments. Absolute velocity limits come from Controller.
 max_control_delta_v: 0.05
