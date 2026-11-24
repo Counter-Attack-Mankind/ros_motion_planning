@@ -1,0 +1,9 @@
+<library path="lib/libmppi_controller">
+  <class name="mppi_controller/MPPIController"
+         type="rmp::controller::MPPIController"
+         base_class_type="nav_core::BaseLocalPlanner">
+    <description>
+      A Model Predictive Path Integral (MPPI) local controller.
+    </description>
+  </class>
+</library>

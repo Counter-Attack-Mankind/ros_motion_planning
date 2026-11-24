@@ -1,0 +1,4 @@
+# MPPI implementation stage. Stage 1 validates move_base/pluginlib integration
+# and intentionally commands zero velocity. Algorithm parameters will be added
+# in subsequent development stages.
+implementation_stage: 1
