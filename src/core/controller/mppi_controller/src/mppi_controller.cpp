@@ -34,6 +34,7 @@ namespace rmp::controller {
 namespace {
 constexpr double kNumericalEpsilon = 1e-12;
 constexpr double kMaximumExponent = 700.0;
+constexpr int kMaximumFallbackCandidates = 5;
 }  // namespace
 
 MPPIController::MPPIController()
@@ -48,6 +49,10 @@ MPPIController::MPPIController()
   , prediction_steps_(60)
   , optimization_iterations_(1)
   , random_seed_(42)
+  , temporal_noise_enabled_(true)
+  , temporal_noise_rho_(0.8)
+  , safety_fallback_enabled_(true)
+  , safety_fallback_max_candidates_(5)
   , noise_std_v_(0.2)
   , noise_std_omega_(0.5)
   , temperature_(1.0)
@@ -121,6 +126,10 @@ void MPPIController::initialize(std::string name, tf2_ros::Buffer* tf,
          << " m, unknown space="
          << (treat_unknown_as_collision_ ? "blocked" : "allowed")
          << ", verified safety horizon=" << collision_safety_horizon_ << " s"
+         << ", temporal noise="
+         << (temporal_noise_enabled_ ? "enabled" : "disabled")
+         << ", safety fallback="
+         << (safety_fallback_enabled_ ? "enabled" : "disabled")
          << ", visualization="
          << (visualization_enabled_ ? "enabled" : "disabled") << ".";
 }
@@ -131,6 +140,15 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
   private_nh.param("optimization_iterations", optimization_iterations_,
                    optimization_iterations_);
   private_nh.param("random_seed", random_seed_, random_seed_);
+  private_nh.param("temporal_noise_enabled", temporal_noise_enabled_,
+                   temporal_noise_enabled_);
+  private_nh.param("temporal_noise_rho", temporal_noise_rho_,
+                   temporal_noise_rho_);
+  private_nh.param("safety_fallback_enabled", safety_fallback_enabled_,
+                   safety_fallback_enabled_);
+  private_nh.param("safety_fallback_max_candidates",
+                   safety_fallback_max_candidates_,
+                   safety_fallback_max_candidates_);
 
   private_nh.param("noise_std_v", noise_std_v_, noise_std_v_);
   private_nh.param("noise_std_omega", noise_std_omega_, noise_std_omega_);
@@ -176,12 +194,20 @@ bool MPPIController::_loadParameters(ros::NodeHandle& private_nh) {
   private_nh.param("goal_reset_angle", goal_reset_angle_, goal_reset_angle_);
 
   const bool dimensions_valid = sample_count_ > 1 && prediction_steps_ > 0 &&
-                                optimization_iterations_ > 0;
+                                optimization_iterations_ > 0 &&
+                                safety_fallback_max_candidates_ >= 0 &&
+                                safety_fallback_max_candidates_ <=
+                                    kMaximumFallbackCandidates &&
+                                (!safety_fallback_enabled_ ||
+                                 safety_fallback_max_candidates_ > 0);
   const bool sampling_valid = std::isfinite(noise_std_v_) &&
                               std::isfinite(noise_std_omega_) &&
                               noise_std_v_ > 0.0 && noise_std_omega_ > 0.0 &&
                               std::isfinite(temperature_) &&
-                              temperature_ > kNumericalEpsilon;
+                              temperature_ > kNumericalEpsilon &&
+                              std::isfinite(temporal_noise_rho_) &&
+                              temporal_noise_rho_ >= 0.0 &&
+                              temporal_noise_rho_ < 1.0;
   const bool limits_valid = std::isfinite(max_control_delta_v_) &&
                             std::isfinite(max_control_delta_omega_) &&
                             std::isfinite(control_dt_) && control_dt_ > 0.0 &&
@@ -487,12 +513,16 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
   std::size_t collision_rejection_count = 0;
   std::size_t safety_rejection_count = 0;
   std::size_t unverified_sample_count = 0;
+  std::vector<FallbackCandidate> fallback_candidates;
+  auto* fallback_candidates_output =
+      safety_fallback_enabled_ ? &fallback_candidates : nullptr;
   if (!_optimizeControlSequence(initial_state, current_control, reference_plan,
                                 collision_model, footprint, inscribed_radius,
                                 circumscribed_radius, &valid_sample_count,
                                 &collision_rejection_count,
                                 &safety_rejection_count,
                                 &unverified_sample_count,
+                                fallback_candidates_output,
                                 sampled_trajectories_output,
                                 rejected_trajectories_output) ||
       nominal_controls_.empty()) {
@@ -514,33 +544,55 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
     return false;
   }
 
-  const Control desired_control =
-      _projectControl(nominal_controls_.front(), current_control);
-  cmd_vel.linear.x =
-      linearRegularization(current_control.v, desired_control.v);
-  cmd_vel.angular.z =
-      angularRegularization(current_control.omega, desired_control.omega);
-
-  if (!std::isfinite(cmd_vel.linear.x) ||
-      !std::isfinite(cmd_vel.angular.z)) {
-    cmd_vel = geometry_msgs::Twist();
+  std::vector<Control> execution_controls;
+  if (!_prepareExecutionControls(nominal_controls_, current_control, &cmd_vel,
+                                 &execution_controls)) {
     _clearVisualization();
     ROS_ERROR_THROTTLE(1.0,
                        "MPPI Controller generated a non-finite velocity command.");
     return false;
   }
 
-  std::vector<Control> execution_controls = nominal_controls_;
-  execution_controls.front() = Control{ cmd_vel.linear.x, cmd_vel.angular.z };
-  Control execution_previous = execution_controls.front();
-  for (std::size_t index = 1; index < execution_controls.size(); ++index) {
-    execution_controls[index] =
-        _projectControl(execution_controls[index], execution_previous);
-    execution_previous = execution_controls[index];
+  bool fallback_used = false;
+  std::size_t fallback_attempts = 0;
+  std::size_t fallback_rank = 0;
+  double fallback_cost = 0.0;
+  const bool weighted_result_safe = _isControlSequenceCollisionFree(
+      initial_state, execution_controls, collision_model, footprint,
+      inscribed_radius, circumscribed_radius);
+  if (!weighted_result_safe && safety_fallback_enabled_) {
+    for (std::size_t index = 0; index < fallback_candidates.size(); ++index) {
+      ++fallback_attempts;
+      geometry_msgs::Twist fallback_command;
+      std::vector<Control> fallback_execution_controls;
+      if (!_prepareExecutionControls(fallback_candidates[index].controls,
+                                     current_control, &fallback_command,
+                                     &fallback_execution_controls)) {
+        continue;
+      }
+      if (!_isControlSequenceCollisionFree(
+              initial_state, fallback_execution_controls, collision_model,
+              footprint, inscribed_radius, circumscribed_radius)) {
+        continue;
+      }
+
+      cmd_vel = fallback_command;
+      execution_controls = std::move(fallback_execution_controls);
+      nominal_controls_ = execution_controls;
+      fallback_used = true;
+      fallback_rank = index + 1;
+      fallback_cost = fallback_candidates[index].cost;
+      ROS_WARN_THROTTLE(
+          1.0,
+          "MPPI weighted result was unsafe; safety fallback selected cost "
+          "rank %zu/%zu (cost=%.3f, attempts=%zu).",
+          fallback_rank, fallback_candidates.size(), fallback_cost,
+          fallback_attempts);
+      break;
+    }
   }
-  if (!_isControlSequenceCollisionFree(
-          initial_state, execution_controls, collision_model, footprint,
-          inscribed_radius, circumscribed_radius)) {
+
+  if (!weighted_result_safe && !fallback_used) {
     cmd_vel = geometry_msgs::Twist();
     _resetControlSequence();
     _clearVisualization();
@@ -550,10 +602,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
             .count();
     ROS_WARN_THROTTLE(
         1.0,
-        "MPPI Controller rejected the optimized command because its final "
-        "predicted trajectory is unsafe (valid=%zu/%d, collision rejected=%zu, "
+        "MPPI weighted result is unsafe; safety fallback %s "
+        "(attempted=%zu/%zu, valid=%zu/%d, collision rejected=%zu, "
         "unverified-prefix rejected=%zu, unverified-tail=%zu, cycle=%.3f ms); "
         "commanding zero velocity.",
+        safety_fallback_enabled_ ? "failed" : "disabled",
+        fallback_attempts, fallback_candidates.size(),
         valid_sample_count, sample_count_ * optimization_iterations_,
         collision_rejection_count, safety_rejection_count,
         unverified_sample_count, elapsed_ms);
@@ -576,11 +630,12 @@ bool MPPIController::computeVelocityCommands(geometry_msgs::Twist& cmd_vel) {
       2.0,
       "MPPI cycle %.3f ms, valid samples %zu/%d, collision rejected %zu, "
       "unverified-prefix rejected %zu, unverified-tail %zu, command v=%.3f "
-      "m/s, omega=%.3f rad/s.",
+      "m/s, omega=%.3f rad/s, solution=%s.",
       elapsed_ms, valid_sample_count,
       sample_count_ * optimization_iterations_,
       collision_rejection_count, safety_rejection_count,
-      unverified_sample_count, cmd_vel.linear.x, cmd_vel.angular.z);
+      unverified_sample_count, cmd_vel.linear.x, cmd_vel.angular.z,
+      fallback_used ? "fallback" : "weighted");
   return true;
 }
 
@@ -630,12 +685,18 @@ bool MPPIController::_optimizeControlSequence(
     std::size_t* collision_rejection_count,
     std::size_t* safety_rejection_count,
     std::size_t* unverified_sample_count,
+    std::vector<FallbackCandidate>* fallback_candidates,
     std::vector<std::vector<State>>* sampled_trajectories,
     std::vector<std::vector<State>>* rejected_trajectories) {
   *valid_sample_count = 0;
   *collision_rejection_count = 0;
   *safety_rejection_count = 0;
   *unverified_sample_count = 0;
+  if (fallback_candidates != nullptr) {
+    fallback_candidates->clear();
+    fallback_candidates->reserve(
+        static_cast<std::size_t>(safety_fallback_max_candidates_));
+  }
   const std::size_t required_verified_steps = std::max<std::size_t>(
       1, static_cast<std::size_t>(
              std::ceil(collision_safety_horizon_ / control_dt_)));
@@ -670,6 +731,8 @@ bool MPPIController::_optimizeControlSequence(
   }
 
   std::normal_distribution<double> normal_distribution(0.0, 1.0);
+  const double temporal_noise_scale = std::sqrt(std::max(
+      0.0, 1.0 - temporal_noise_rho_ * temporal_noise_rho_));
   std::size_t final_valid_sample_count = 0;
   std::size_t total_valid_sample_count = 0;
   std::size_t total_collision_rejection_count = 0;
@@ -686,6 +749,7 @@ bool MPPIController::_optimizeControlSequence(
     for (int sample = 0; sample < sample_count_; ++sample) {
       State state = initial_state;
       Control previous_control = current_control;
+      double previous_noise_omega = 0.0;
       const bool record_sample =
           (sampled_trajectories != nullptr &&
            sampled_trajectories->size() <
@@ -709,10 +773,16 @@ bool MPPIController::_optimizeControlSequence(
         const double noise_v =
             sample == 0 ? 0.0 :
                           noise_std_v_ * normal_distribution(random_generator_);
-        const double noise_omega =
+        const double independent_noise_omega =
             sample == 0 ?
                 0.0 :
                 noise_std_omega_ * normal_distribution(random_generator_);
+        double noise_omega = independent_noise_omega;
+        if (sample != 0 && temporal_noise_enabled_ && step > 0) {
+          noise_omega = temporal_noise_rho_ * previous_noise_omega +
+                        temporal_noise_scale * independent_noise_omega;
+        }
+        previous_noise_omega = noise_omega;
 
         Control sampled_control{
           nominal_controls_[step].v + noise_v,
@@ -799,6 +869,25 @@ bool MPPIController::_optimizeControlSequence(
       if (std::isfinite(total_cost)) {
         sample_costs[sample] = total_cost;
         ++iteration_valid_sample_count;
+        if (fallback_candidates != nullptr) {
+          const auto position = std::lower_bound(
+              fallback_candidates->begin(), fallback_candidates->end(),
+              total_cost,
+              [](const FallbackCandidate& candidate, double cost) {
+                return candidate.cost < cost;
+              });
+          if (fallback_candidates->size() < static_cast<std::size_t>(
+                  safety_fallback_max_candidates_) ||
+              position != fallback_candidates->end()) {
+            fallback_candidates->insert(
+                position,
+                FallbackCandidate{ total_cost, sampled_controls[sample] });
+            if (fallback_candidates->size() > static_cast<std::size_t>(
+                    safety_fallback_max_candidates_)) {
+              fallback_candidates->pop_back();
+            }
+          }
+        }
         if (sample_has_unverified_tail) {
           ++total_unverified_sample_count;
         }
@@ -1215,6 +1304,46 @@ void MPPIController::_projectControlSequence(
     control = _projectControl(control, previous_control);
     previous_control = control;
   }
+}
+
+bool MPPIController::_prepareExecutionControls(
+    const std::vector<Control>& source_controls,
+    const Control& current_control, geometry_msgs::Twist* command,
+    std::vector<Control>* execution_controls) {
+  *command = geometry_msgs::Twist();
+  execution_controls->clear();
+  if (source_controls.empty()) {
+    return false;
+  }
+
+  const Control desired_control =
+      _projectControl(source_controls.front(), current_control);
+  command->linear.x =
+      linearRegularization(current_control.v, desired_control.v);
+  command->angular.z =
+      angularRegularization(current_control.omega, desired_control.omega);
+  if (!std::isfinite(command->linear.x) ||
+      !std::isfinite(command->angular.z)) {
+    *command = geometry_msgs::Twist();
+    return false;
+  }
+
+  *execution_controls = source_controls;
+  execution_controls->front() =
+      Control{ command->linear.x, command->angular.z };
+  Control previous_control = execution_controls->front();
+  for (std::size_t index = 1; index < execution_controls->size(); ++index) {
+    (*execution_controls)[index] =
+        _projectControl((*execution_controls)[index], previous_control);
+    if (!std::isfinite((*execution_controls)[index].v) ||
+        !std::isfinite((*execution_controls)[index].omega)) {
+      *command = geometry_msgs::Twist();
+      execution_controls->clear();
+      return false;
+    }
+    previous_control = (*execution_controls)[index];
+  }
+  return true;
 }
 
 std::size_t MPPIController::_nearestReferenceIndex(

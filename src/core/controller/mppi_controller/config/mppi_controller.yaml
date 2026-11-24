@@ -3,6 +3,10 @@ sample_count: 200
 prediction_steps: 60
 optimization_iterations: 1
 random_seed: 42
+temporal_noise_enabled: true
+temporal_noise_rho: 0.8
+safety_fallback_enabled: true
+safety_fallback_max_candidates: 5
 
 # Gaussian control perturbations
 noise_std_v: 0.20

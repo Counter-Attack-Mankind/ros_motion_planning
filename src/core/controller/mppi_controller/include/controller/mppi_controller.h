@@ -65,6 +65,11 @@ private:
     double omega{ 0.0 };
   };
 
+  struct FallbackCandidate {
+    double cost{ 0.0 };
+    std::vector<Control> controls;
+  };
+
   enum class CollisionCheckResult {
     kFree,
     kCollision,
@@ -88,6 +93,7 @@ private:
       std::size_t* collision_rejection_count,
       std::size_t* safety_rejection_count,
       std::size_t* unverified_sample_count,
+      std::vector<FallbackCandidate>* fallback_candidates,
       std::vector<std::vector<State>>* sampled_trajectories,
       std::vector<std::vector<State>>* rejected_trajectories);
 
@@ -119,6 +125,11 @@ private:
                           const Control& previous_control) const;
 
   void _projectControlSequence(const Control& current_control);
+
+  bool _prepareExecutionControls(
+      const std::vector<Control>& source_controls,
+      const Control& current_control, geometry_msgs::Twist* command,
+      std::vector<Control>* execution_controls);
 
   std::size_t _nearestReferenceIndex(
       const State& state,
@@ -177,6 +188,10 @@ private:
   int prediction_steps_;
   int optimization_iterations_;
   int random_seed_;
+  bool temporal_noise_enabled_;
+  double temporal_noise_rho_;
+  bool safety_fallback_enabled_;
+  int safety_fallback_max_candidates_;
 
   double noise_std_v_;
   double noise_std_omega_;
